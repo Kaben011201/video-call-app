@@ -125,7 +125,9 @@ export default function VideoCall() {
 
     await initMedia();
 
-    socket.current = new WebSocket("ws://localhost:3001");
+    socket.current = new WebSocket(
+      "wss://signaling-server-production-339e.up.railway.app",
+    );
 
     socket.current.onopen = () => {
       socket.current?.send(
