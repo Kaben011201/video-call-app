@@ -16,7 +16,9 @@ export default function VideoCall() {
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
 
-    socket.current = new WebSocket("ws://localhost:3001");
+    socket.current = new WebSocket(
+      "wss://video-call-app-production-b7d6.up.railway.app",
+    );
 
     socket.current.onmessage = async (event) => {
       const data = JSON.parse(event.data);
