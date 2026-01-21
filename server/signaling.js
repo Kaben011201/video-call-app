@@ -1,6 +1,8 @@
 import { WebSocketServer } from "ws";
 
-const wss = new WebSocketServer("wss:https://video-call-app-wheat.vercel.app/");
+const wss = new WebSocketServer(
+  "wss:https://video-call-app-production-b7d6.up.railway.app/",
+);
 
 wss.on("connection", (ws) => {
   console.log("🔌 Client connected");
