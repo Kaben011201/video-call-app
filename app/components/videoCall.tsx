@@ -17,7 +17,7 @@ export default function VideoCall() {
     });
 
     socket.current = new WebSocket(
-      "wss://video-call-app-production-b7d6.up.railway.app",
+      "wss://signaling-server-production-339e.up.railway.app",
     );
 
     socket.current.onmessage = async (event) => {
