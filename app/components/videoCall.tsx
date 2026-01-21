@@ -236,9 +236,9 @@ export default function VideoCall() {
       )}
 
       {activeSpeaker && (
-        <div className="mt-4 p-4 border border-green-500 bg-green-100">
+        <div className="mt-4 p-4 border border-green-500 bg-slate-800">
           <h2 className="text-lg font-semibold">Active Speaker</h2>
-          <p>User ID: {activeSpeaker}</p>
+          <p className="text-white">User ID: {activeSpeaker}</p>
         </div>
       )}
     </div>
