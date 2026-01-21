@@ -1,3 +1,11 @@
+import { WebSocketServer } from "ws";
+
+const PORT = process.env.PORT || 3001;
+const wss = new WebSocketServer({ port: PORT });
+
+// roomId -> Set(ws)
+const rooms = new Map();
+
 wss.on("connection", (ws) => {
   ws.on("message", (msg) => {
     const data = JSON.parse(msg.toString());
@@ -60,3 +68,6 @@ wss.on("connection", (ws) => {
     });
   });
 });
+
+
+console.log("🚀 Signaling server running on port", PORT);
