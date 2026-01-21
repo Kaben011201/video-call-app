@@ -7,54 +7,59 @@ const ROOM_ID = "room-1";
 export default function VideoCall() {
   const localVideo = useRef<HTMLVideoElement>(null);
   const socket = useRef<WebSocket | null>(null);
-  const [callStarted, setCallStarted] = useState(false);
 
-  const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
-
-
+  const localStreamRef = useRef<MediaStream | null>(null);
   const peers = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const pendingCandidates = useRef<Map<string, RTCIceCandidateInit[]>>(
+    new Map(),
+  );
+
   const audioContextRef = useRef<AudioContext | null>(null);
 
-  const startAudioDetection = (userId: string, stream: MediaStream) => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new AudioContext();
-    }
+  const userId = useRef(crypto.randomUUID());
 
-    const audioContext = audioContextRef.current;
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-
-    const source = audioContext.createMediaStreamSource(stream);
-    source.connect(analyser);
-
-    const data = new Uint8Array(analyser.frequencyBinCount);
-
-    const checkVolume = () => {
-      analyser.getByteFrequencyData(data);
-
-      const volume = data.reduce((sum, value) => sum + value, 0) / data.length;
-
-      if (volume > 25) {
-        setActiveSpeaker(userId);
-      }
-
-      requestAnimationFrame(checkVolume);
-    };
-
-    checkVolume();
-  };
-
+  const [callStarted, setCallStarted] = useState(false);
+  const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<
     { userId: string; stream: MediaStream }[]
   >([]);
 
-  const userId = useRef(crypto.randomUUID());
+  /* ================= AUDIO DETECTION ================= */
+
+  const startAudioDetection = (uid: string, stream: MediaStream) => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+
+    const ctx = audioContextRef.current;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(analyser);
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const loop = () => {
+      analyser.getByteFrequencyData(data);
+      const volume = data.reduce((sum, v) => sum + v, 0) / data.length;
+
+      if (volume > 25) setActiveSpeaker(uid);
+      requestAnimationFrame(loop);
+    };
+
+    loop();
+  };
+
+  /* ================= MEDIA ================= */
 
   const initMedia = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: true,
       audio: true,
     });
+
+    localStreamRef.current = stream;
 
     if (localVideo.current) {
       localVideo.current.srcObject = stream;
@@ -63,10 +68,10 @@ export default function VideoCall() {
     return stream;
   };
 
+  /* ================= PEER ================= */
 
   const createPeer = useCallback(
     async (remoteUserId: string, isCaller: boolean) => {
-      // 🚫 DO NOT recreate peers
       if (peers.current.has(remoteUserId)) return;
 
       const pc = new RTCPeerConnection({
@@ -75,21 +80,31 @@ export default function VideoCall() {
 
       peers.current.set(remoteUserId, pc);
 
-      const localStream = localVideo.current!.srcObject as MediaStream;
+      const localStream = localStreamRef.current;
+      if (!localStream) return;
+
       localStream
         .getTracks()
         .forEach((track) => pc.addTrack(track, localStream));
 
       pc.ontrack = (e) => {
-        const stream = e.streams[0];
+        // eslint-disable-next-line prefer-const
+        let existing = remoteStreams.find((r) => r.userId === remoteUserId);
 
-        setRemoteStreams((prev) => {
-          // ✅ ENSURE UNIQUE USER
-          if (prev.some((p) => p.userId === remoteUserId)) return prev;
-          return [...prev, { userId: remoteUserId, stream }];
-        });
+        let stream = existing?.stream;
 
-        startAudioDetection(remoteUserId, stream);
+        if (!stream) {
+          stream = new MediaStream();
+
+          setRemoteStreams((prev) => [
+            ...prev,
+            { userId: remoteUserId, stream: stream as MediaStream },
+          ]);
+
+          startAudioDetection(remoteUserId, stream);
+        }
+
+        stream.addTrack(e.track);
       };
 
       pc.onicecandidate = (e) => {
@@ -97,8 +112,8 @@ export default function VideoCall() {
           socket.current?.send(
             JSON.stringify({
               type: "signal",
-              to: remoteUserId,
               from: userId.current,
+              to: remoteUserId,
               candidate: e.candidate,
             }),
           );
@@ -112,16 +127,17 @@ export default function VideoCall() {
         socket.current?.send(
           JSON.stringify({
             type: "signal",
-            to: remoteUserId,
             from: userId.current,
+            to: remoteUserId,
             offer,
           }),
         );
       }
     },
-    [],
+    [remoteStreams],
   );
 
+  /* ================= CALL ================= */
 
   const startCall = async () => {
     if (callStarted) return;
@@ -147,7 +163,6 @@ export default function VideoCall() {
       const data = JSON.parse(event.data);
 
       if (data.type === "existing-users") {
-        // 🟢 Create offers to everyone already in the room
         data.users.forEach((uid: string) => {
           createPeer(uid, true);
         });
@@ -167,55 +182,72 @@ export default function VideoCall() {
           }
 
           await pc.setRemoteDescription(data.offer);
+
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
 
           socket.current?.send(
             JSON.stringify({
               type: "signal",
-              to: data.from,
               from: userId.current,
+              to: data.from,
               answer,
             }),
           );
+
+          const queued = pendingCandidates.current.get(data.from) || [];
+          for (const c of queued) await pc.addIceCandidate(c);
+          pendingCandidates.current.delete(data.from);
         }
 
         if (data.answer && pc) {
           await pc.setRemoteDescription(data.answer);
+
+          const queued = pendingCandidates.current.get(data.from) || [];
+          for (const c of queued) await pc.addIceCandidate(c);
+          pendingCandidates.current.delete(data.from);
         }
 
         if (data.candidate && pc) {
-          await pc.addIceCandidate(data.candidate);
+          if (pc.remoteDescription) {
+            await pc.addIceCandidate(data.candidate);
+          } else {
+            const list = pendingCandidates.current.get(data.from) || [];
+            list.push(data.candidate);
+            pendingCandidates.current.set(data.from, list);
+          }
         }
       }
 
       if (data.type === "user-left") {
-        const pc = peers.current.get(data.userId);
-        pc?.close();
+        peers.current.get(data.userId)?.close();
         peers.current.delete(data.userId);
 
         setRemoteStreams((prev) =>
-          prev.filter((p) => p.userId !== data.userId),
+          prev.filter((r) => r.userId !== data.userId),
         );
       }
     };
   };
 
-
+  /* ================= UI ================= */
 
   return (
     <div>
       <h1 className="text-2xl font-bold mb-4">Video Call</h1>
+
       <div className="grid grid-cols-3 gap-4">
         <div>
-          <h2 className="text-lg font-semibold">Local Video</h2>
+          <h2 className="font-semibold">Local</h2>
           <video
             ref={localVideo}
             autoPlay
             muted
-            className="w-full h-auto border"
-          ></video>
+            playsInline
+            className="w-full border"
+          />
         </div>
+
         {remoteStreams.map(({ userId, stream }) => (
           <video
             key={userId}
@@ -232,10 +264,11 @@ export default function VideoCall() {
           />
         ))}
       </div>
+
       {!callStarted && (
         <button
           onClick={startCall}
-          className="mb-4 px-4 py-2 bg-black text-white rounded"
+          className="mt-4 px-4 py-2 bg-black text-white rounded"
         >
           Start Call
         </button>
@@ -243,8 +276,7 @@ export default function VideoCall() {
 
       {activeSpeaker && (
         <div className="mt-4 p-4 border border-green-500 bg-green-100">
-          <h2 className="text-lg font-semibold">Active Speaker</h2>
-          <p>User ID: {activeSpeaker}</p>
+          Active Speaker: {activeSpeaker}
         </div>
       )}
     </div>
