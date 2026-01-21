@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 const ROOM_ID = "room-1";
 
 export default function VideoCall() {
   const localVideo = useRef<HTMLVideoElement>(null);
   const socket = useRef<WebSocket | null>(null);
+  const [callStarted, setCallStarted] = useState(false);
+
   const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
 
 
@@ -48,58 +50,85 @@ export default function VideoCall() {
 
   const userId = useRef(crypto.randomUUID());
 
-  const createPeer = async (remoteUserId: string, isCaller: boolean) => {
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  const initMedia = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true,
     });
 
-    peers.current.set(remoteUserId, pc);
+    if (localVideo.current) {
+      localVideo.current.srcObject = stream;
+    }
 
-    const stream = localVideo.current!.srcObject as MediaStream;
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-   pc.ontrack = (e) => {
-     const stream = e.streams[0];
-
-     setRemoteStreams((prev) => [...prev, { userId: remoteUserId, stream }]);
-
-     // 👇 THIS IS WHERE AUDIO CHECKING STARTS
-     startAudioDetection(remoteUserId, stream);
-   };
+    return stream;
+  };
 
 
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
+  const createPeer = useCallback(
+    async (remoteUserId: string, isCaller: boolean) => {
+      // 🚫 DO NOT recreate peers
+      if (peers.current.has(remoteUserId)) return;
+
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      });
+
+      peers.current.set(remoteUserId, pc);
+
+      const localStream = localVideo.current!.srcObject as MediaStream;
+      localStream
+        .getTracks()
+        .forEach((track) => pc.addTrack(track, localStream));
+
+      pc.ontrack = (e) => {
+        const stream = e.streams[0];
+
+        setRemoteStreams((prev) => {
+          // ✅ ENSURE UNIQUE USER
+          if (prev.some((p) => p.userId === remoteUserId)) return prev;
+          return [...prev, { userId: remoteUserId, stream }];
+        });
+
+        startAudioDetection(remoteUserId, stream);
+      };
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          socket.current?.send(
+            JSON.stringify({
+              type: "signal",
+              to: remoteUserId,
+              from: userId.current,
+              candidate: e.candidate,
+            }),
+          );
+        }
+      };
+
+      if (isCaller) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
         socket.current?.send(
           JSON.stringify({
             type: "signal",
             to: remoteUserId,
             from: userId.current,
-            candidate: e.candidate,
-          })
+            offer,
+          }),
         );
       }
-    };
+    },
+    [],
+  );
 
-    if (isCaller) {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
 
-      socket.current?.send(
-        JSON.stringify({
-          type: "signal",
-          to: remoteUserId,
-          from: userId.current,
-          offer,
-        })
-      );
-    }
-  };
+  const startCall = async () => {
+    if (callStarted) return;
 
-  useEffect(() => {
-    socket.current = new WebSocket(
-      "wss://signaling-server-production-339e.up.railway.app",
-    );
+    await initMedia();
+
+    socket.current = new WebSocket("ws://localhost:3001");
 
     socket.current.onopen = () => {
       socket.current?.send(
@@ -107,24 +136,37 @@ export default function VideoCall() {
           type: "join",
           roomId: ROOM_ID,
           userId: userId.current,
-        })
+        }),
       );
+      setCallStarted(true);
     };
 
     socket.current.onmessage = async (event) => {
       const data = JSON.parse(event.data);
+
+      if (data.type === "existing-users") {
+        // 🟢 Create offers to everyone already in the room
+        data.users.forEach((uid: string) => {
+          createPeer(uid, true);
+        });
+      }
 
       if (data.type === "user-joined") {
         createPeer(data.userId, true);
       }
 
       if (data.type === "signal") {
-        const pc = peers.current.get(data.from);
+        let pc = peers.current.get(data.from);
 
         if (data.offer) {
-          await pc?.setRemoteDescription(data.offer);
-          const answer = await pc?.createAnswer();
-          await pc?.setLocalDescription(answer!);
+          if (!pc) {
+            await createPeer(data.from, false);
+            pc = peers.current.get(data.from)!;
+          }
+
+          await pc.setRemoteDescription(data.offer);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
 
           socket.current?.send(
             JSON.stringify({
@@ -132,26 +174,32 @@ export default function VideoCall() {
               to: data.from,
               from: userId.current,
               answer,
-            })
+            }),
           );
         }
 
-        if (data.answer) {
-          await pc?.setRemoteDescription(data.answer);
+        if (data.answer && pc) {
+          await pc.setRemoteDescription(data.answer);
         }
 
-        if (data.candidate) {
-          await pc?.addIceCandidate(data.candidate);
+        if (data.candidate && pc) {
+          await pc.addIceCandidate(data.candidate);
         }
       }
-    };
 
-    navigator.mediaDevices
-      .getUserMedia({ video: true, audio: true })
-      .then((stream) => {
-        localVideo.current!.srcObject = stream;
-      });
-  }, []);
+      if (data.type === "user-left") {
+        const pc = peers.current.get(data.userId);
+        pc?.close();
+        peers.current.delete(data.userId);
+
+        setRemoteStreams((prev) =>
+          prev.filter((p) => p.userId !== data.userId),
+        );
+      }
+    };
+  };
+
+
 
   return (
     <div>
@@ -182,6 +230,14 @@ export default function VideoCall() {
           />
         ))}
       </div>
+      {!callStarted && (
+        <button
+          onClick={startCall}
+          className="mb-4 px-4 py-2 bg-black text-white rounded"
+        >
+          Start Call
+        </button>
+      )}
 
       {activeSpeaker && (
         <div className="mt-4 p-4 border border-green-500 bg-green-100">
